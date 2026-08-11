@@ -34,6 +34,10 @@ def AS_AT_DATE_CLEAN(df, as_at_col, payment_col):
     Re-validates the column and returns a cleaning report.
     """
 
+    df_copy = df.copy()
+
+    df_copy[as_at_col] = pd.to_datetime(df_copy[as_at_col], errors='coerce')
+
     # Step 1: detect missing values using the existing validator
     before_check = check_missing(df, as_at_col)
 
@@ -63,14 +67,14 @@ def AS_AT_DATE_CLEAN(df, as_at_col, payment_col):
         "message": f"{before_check['message']} -> {missing_mask.sum()} rows substituted using quarter-end of '{payment_col}'",
         "rows_fixed": int(missing_mask.sum()),
         "remaining_issues": after_check["failed_rows"]
-    }
+    }, df_copy
 
 
 def PAYMENT_DATE_CLEAN(df, payment_date_col, status_col, condition_value='PAID'):
     """
     Wipes payment dates for non-qualifying statuses and reports missing/cleared date counts.
     Parameters: df (DataFrame), payment_date_col (str), status_col (str), condition_value (str, default 'PAID').
-    Returns: (DataFrame, wiped_count: int, missing_paid_dates: int)
+    Returns: dict report with keys: column, status, message, wiped_count, missing_paid_dates, df
     """
 
     df_copy = df.copy()
@@ -82,25 +86,33 @@ def PAYMENT_DATE_CLEAN(df, payment_date_col, status_col, condition_value='PAID')
     paid_mask = df_copy[status_col] == condition_value
 
     # Step 2: Count rows that had a date before wiping them
-    wiped_count = (not_paid_mask & df_copy[payment_date_col].notnull()).sum()
+    wiped_count = int((not_paid_mask & df_copy[payment_date_col].notnull()).sum())
 
     # Step 3: Wipe payment date where status is NOT the condition value
     df_copy.loc[not_paid_mask, payment_date_col] = np.nan
 
     # Step 4: Count paid rows missing a payment date
-    missing_paid_dates = df_copy.loc[paid_mask, payment_date_col].isnull().sum()
+    missing_paid_dates = int(df_copy.loc[paid_mask, payment_date_col].isnull().sum())
 
-    print(f"Rows with status != '{condition_value}' (payment date wiped): {wiped_count}")
-    print(f"Rows with status == '{condition_value}' but missing payment date: {missing_paid_dates}")
+    # Step 5: determine overall status for the report
+    status = "PASS" if missing_paid_dates == 0 else "FAIL"
 
-    return df_copy, wiped_count, missing_paid_dates
+    return {
+        "column": payment_date_col,
+        "status": status,
+        "message": f"{wiped_count} dates wiped (status != '{condition_value}'); "
+                   f"{missing_paid_dates} PAID rows still missing a payment date",
+        "wiped_count": wiped_count,
+        "missing_paid_dates": missing_paid_dates,
+    }, df_copy
 
 
 def PAYMENT_VS_LOSS_DATE_VALIDATE(df, payment_date_col, loss_date_col, allow_same_day=True):
     """
-    Validates that payment dates occur on or after loss dates and tags each row with validation results
+    Validates that payment dates occur on or after loss dates and tags each row with validation results.
     Parameters: df (DataFrame), payment_date_col (str), loss_date_col (str), allow_same_day (bool, default True).
-    Returns: (DataFrame, invalid_count: int, invalid_rows: DataFrame)
+    Returns: dict report with keys: column, status, message, checked_count, skipped_count,
+    invalid_count, df, invalid_rows
     """
 
     df_copy = df.copy()
@@ -118,31 +130,42 @@ def PAYMENT_VS_LOSS_DATE_VALIDATE(df, payment_date_col, loss_date_col, allow_sam
     else:
         invalid_mask = both_present_mask & (df_copy[payment_date_col] <= df_copy[loss_date_col])
 
-    invalid_count = invalid_mask.sum()
-    checked_count = both_present_mask.sum()
-    skipped_count = len(df_copy) - checked_count  # rows missing one or both dates
+    invalid_count = int(invalid_mask.sum())
+    checked_count = int(both_present_mask.sum())
+    skipped_count = int(len(df_copy) - checked_count)  # rows missing one or both dates
 
-    print(f"Rows checked (both dates present): {checked_count}")
-    print(f"Rows skipped (missing date(s)): {skipped_count}")
-    print(f"Invalid rows (payment date before loss date): {invalid_count}")
-
-    # Step 4: mark each row so you can filter/audit later
+    # Step 4: mark each row so you can filter/audit later (vectorized, no loop needed)
     df_copy['PAYMENT_VS_LOSS_VALIDATION'] = np.where(
         ~both_present_mask, 'MISSING_DATE',
         np.where(invalid_mask, 'INVALID_PAYMENT_BEFORE_LOSS', 'VALID')
     )
 
-    return df_copy, invalid_count, df_copy.loc[invalid_mask]
+    # Step 5: overall status for the report
+    status = "PASS" if invalid_count == 0 else "FAIL"
+
+    return {
+        "column": f"{payment_date_col} vs {loss_date_col}",
+        "status": status,
+        "message": f"{checked_count} rows checked; {skipped_count} skipped (missing date(s)); "
+                   f"{invalid_count} invalid (payment date before loss date)",
+        "checked_count": checked_count,
+        "skipped_count": skipped_count,
+        "invalid_count": invalid_count,
+    }, df_copy
 
 
 def VALUATION_VS_LOSS_DATE_VALIDATE(df1, df2, key_col, valuation_date_col, loss_date_col, allow_same_day=True):
     """
-    df1              : main dataframe containing loss_date_col and key_col
-    df2              : second dataframe (from another sheet) containing valuation_date_col and key_col
-    key_col          : column name used to join df1 and df2 (must exist in both, same name)
-    valuation_date_col : name of the valuation date column (in df2)
-    loss_date_col    : name of the loss date column (in df1)
+    Validates that loss dates occur on or before valuation dates and tags each row with validation results.
+    df1                 : main dataframe containing loss_date_col and key_col
+    df2                 : second dataframe (from another sheet) containing valuation_date_col and key_col
+    key_col             : column name used to join df1 and df2 (must exist in both, same name)
+    valuation_date_col  : name of the valuation date column (in df2)
+    loss_date_col       : name of the loss date column (in df1)
+    Returns: dict report with keys: column, status, message, checked_count, skipped_count,
+    invalid_count, unmatched_count, df, invalid_rows
     """
+
     df1_copy = df1.copy()
     df2_copy = df2.copy()
 
@@ -166,14 +189,10 @@ def VALUATION_VS_LOSS_DATE_VALIDATE(df1, df2, key_col, valuation_date_col, loss_
     else:
         invalid_mask = both_present_mask & (df_copy[loss_date_col] >= df_copy[valuation_date_col])
 
-    invalid_count = invalid_mask.sum()
-    checked_count = both_present_mask.sum()
-    skipped_count = len(df_copy) - checked_count  # rows missing one or both dates (incl. failed merges)
-    unmatched_count = df_copy[valuation_date_col].isnull().sum() - df1_copy[loss_date_col].isnull().sum()
-
-    print(f"Rows checked (both dates present): {checked_count}")
-    print(f"Rows skipped (missing date(s)): {skipped_count}")
-    print(f"Invalid rows (loss date after valuation date): {invalid_count}")
+    invalid_count = int(invalid_mask.sum())
+    checked_count = int(both_present_mask.sum())
+    skipped_count = int(len(df_copy) - checked_count)  # rows missing one or both dates (incl. failed merges)
+    unmatched_count = int(df_copy[valuation_date_col].isnull().sum() - df1_copy[loss_date_col].isnull().sum())
 
     # Step 5: mark each row so you can filter/audit later
     df_copy['VALUATION_VS_LOSS_VALIDATION'] = np.where(
@@ -181,7 +200,20 @@ def VALUATION_VS_LOSS_DATE_VALIDATE(df1, df2, key_col, valuation_date_col, loss_
         np.where(invalid_mask, 'INVALID_LOSS_AFTER_VALUATION', 'VALID')
     )
 
-    return df_copy, invalid_count, df_copy.loc[invalid_mask]
+    # Step 6: overall status for the report
+    status = "PASS" if invalid_count == 0 else "FAIL"
+
+    return {
+        "column": f"{loss_date_col} vs {valuation_date_col}",
+        "status": status,
+        "message": f"{checked_count} rows checked; {skipped_count} skipped (missing date(s)); "
+                    f"{invalid_count} invalid (loss date after valuation date); "
+                    f"{unmatched_count} rows unmatched in merge with df2",
+        "checked_count": checked_count,
+        "skipped_count": skipped_count,
+        "invalid_count": invalid_count,
+        "unmatched_count": unmatched_count,
+    }, df_copy
 
 
 def MASTER_DATA_QUALITY_REPORT(
