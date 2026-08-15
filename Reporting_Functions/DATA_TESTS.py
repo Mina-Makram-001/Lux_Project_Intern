@@ -196,3 +196,11 @@ def VALUATION_VS_LOSS_DATE_VALIDATE(df1, df2, key_col, valuation_date_col, loss_
         "duplicate_keys_count": duplicate_keys_count,   # <- clean key name, computed early
         "invalid_rows": df_copy.loc[invalid_mask]
     }, df_copy
+
+
+def tests_agg(**t):
+    list_of_tests = []
+    for key, value in t.items():
+        list_of_tests.append(value)
+
+    return list_of_tests
